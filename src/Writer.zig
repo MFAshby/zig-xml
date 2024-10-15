@@ -193,6 +193,7 @@ fn newLineAndIndent(writer: *Writer) anyerror!void {
     }
 }
 
-fn raw(writer: *Writer, s: []const u8) anyerror!void {
+// Exposed in case you need to write raw child values
+pub fn raw(writer: *Writer, s: []const u8) anyerror!void {
     try writer.sink.write(s);
 }
