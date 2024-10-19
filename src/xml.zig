@@ -62,6 +62,14 @@ pub const PrefixedQName = struct {
     }
 };
 
+pub const Namespace = struct {
+    prefix: []const u8,
+    namespace: []const u8,
+    pub fn is(self: Namespace, prefix: []const u8, local: []const u8) bool {
+        return std.mem.eql(u8, self.prefix, prefix) and std.mem.eql(u8, self.local, local);
+    }
+};
+
 pub const predefined_entities = std.StaticStringMap([]const u8).initComptime(.{
     .{ "lt", "<" },
     .{ "gt", ">" },
@@ -476,8 +484,8 @@ pub fn StreamingOutput(comptime WriterType: type) type {
 
         pub const Error = WriterType.Error;
 
-        pub fn writer(out: *const @This(), options: Writer.Options) GenericWriter(Error) {
-            return .{ .writer = Writer.init(out.sink(), options) };
+        pub fn writer(out: *const @This(), options: Writer.Options, allocator: std.mem.Allocator) GenericWriter(Error) {
+            return .{ .writer = Writer.init(out.sink(), options, allocator) };
         }
 
         pub fn sink(out: *const @This()) Writer.Sink {

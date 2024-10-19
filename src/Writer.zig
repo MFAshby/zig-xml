@@ -1,4 +1,6 @@
 const std = @import("std");
+const PrefixedQName = @import("xml.zig").PrefixedQName;
+const Namespace = @import("xml.zig").Namespace;
 const assert = std.debug.assert;
 
 options: Options,
@@ -7,6 +9,10 @@ state: State,
 indent_level: u32,
 
 sink: Sink,
+
+allocator: std.mem.Allocator,
+// it's actually a stack.
+namespaces: std.ArrayListUnmanaged(?[]const Namespace),
 
 const Writer = @This();
 
@@ -33,7 +39,7 @@ const State = enum {
     end,
 };
 
-pub fn init(sink: Sink, options: Options) Writer {
+pub fn init(sink: Sink, options: Options, allocator: std.mem.Allocator) Writer {
     return .{
         .options = options,
 
@@ -41,7 +47,13 @@ pub fn init(sink: Sink, options: Options) Writer {
         .indent_level = 0,
 
         .sink = sink,
+        .allocator = allocator,
+        .namespaces = std.ArrayListUnmanaged(?[]const Namespace){},
     };
+}
+
+pub fn deinit(self: *Writer) void {
+    self.namespaces.deinit(self.allocator);
 }
 
 pub const WriteError = error{};
@@ -73,6 +85,9 @@ pub fn xmlDeclaration(writer: *Writer, encoding: ?[]const u8, standalone: ?bool)
 }
 
 pub fn elementStart(writer: *Writer, name: []const u8) anyerror!void {
+    return elementStartNs(writer, name, null, null);
+}
+pub fn elementStartNs(writer: *Writer, name: []const u8, namespace: ?[]const u8, namespaces: ?[]const Namespace) anyerror!void {
     switch (writer.state) {
         .start, .after_bom, .after_xml_declaration, .text => {},
         .element_start => {
@@ -84,13 +99,37 @@ pub fn elementStart(writer: *Writer, name: []const u8) anyerror!void {
         },
         .end => unreachable,
     }
+    // push any namespaces into the stack
+    try writer.namespaces.append(writer.allocator, namespaces);
+    // now lookup the namespace for the current name
     try writer.raw("<");
+    if (namespace) |ns| {
+        if (writer.lookupNamespacePrefix(ns)) |prefix| {
+            try writer.raw(prefix);
+            try writer.raw(":");
+        } else {
+            std.log.err("xml write error, no prefix for namespace {s}", .{ns});
+            return error.XmlFormatError; // No prefix
+        }
+    }
     try writer.raw(name);
     writer.state = .element_start;
     writer.indent_level += 1;
+
+    // Now add namespace declarations.
+    if (namespaces) |nss| {
+        for (nss) |ns| {
+            const attrname = try std.fmt.allocPrint(writer.allocator, "xmlns:{s}", .{ns.prefix});
+            defer writer.allocator.free(attrname);
+            try writer.attribute(attrname, ns.namespace);
+        }
+    }
 }
 
 pub fn elementEnd(writer: *Writer, name: []const u8) anyerror!void {
+    return writer.elementEndNs(name, null);
+}
+pub fn elementEndNs(writer: *Writer, name: []const u8, namespace: ?[]const u8) anyerror!void {
     writer.indent_level -= 1;
     switch (writer.state) {
         .text => {},
@@ -104,6 +143,14 @@ pub fn elementEnd(writer: *Writer, name: []const u8) anyerror!void {
         .start, .after_bom, .after_xml_declaration, .end => unreachable,
     }
     try writer.raw("</");
+    if (namespace) |ns| {
+        const prefix = writer.lookupNamespacePrefix(ns) orelse {
+            std.log.err("xml write error, no prefix for namespace {s}", .{ns});
+            return error.XmlFormatError;
+        };
+        try writer.raw(prefix);
+        try writer.raw(":");
+    }
     try writer.raw(name);
     try writer.raw(">");
     writer.state = if (writer.indent_level > 0) .after_structure_end else .end;
@@ -196,4 +243,18 @@ fn newLineAndIndent(writer: *Writer) anyerror!void {
 // Exposed in case you need to write raw child values
 pub fn raw(writer: *Writer, s: []const u8) anyerror!void {
     try writer.sink.write(s);
+}
+
+fn lookupNamespacePrefix(writer: *Writer, namespace: []const u8) ?[]const u8 {
+    for (0..writer.namespaces.items.len) |ri| {
+        const i = (writer.namespaces.items.len - 1) - ri;
+        if (writer.namespaces.items[i]) |nsstack| {
+            for (nsstack) |ns| {
+                if (std.mem.eql(u8, namespace, ns.namespace)) {
+                    return ns.prefix;
+                }
+            }
+        }
+    }
+    return null;
 }
