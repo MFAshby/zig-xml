@@ -480,8 +480,8 @@ pub fn StreamingOutput(comptime WriterType: type) type {
 
         pub const Error = WriterType.Error;
 
-        pub fn writer(out: *const @This(), options: Writer.Options) GenericWriter(Error) {
-            return .{ .writer = Writer.init(out.sink(), options) };
+        pub fn writer(out: *const @This(), a: std.mem.Allocator, options: Writer.Options) anyerror!GenericWriter(Error) {
+            return .{ .writer = try Writer.init(a, out.sink(), options) };
         }
 
         pub fn sink(out: *const @This()) Writer.Sink {

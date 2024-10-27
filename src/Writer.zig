@@ -1,12 +1,35 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+// hard-coded prefixes list
+// TODO generate prefixes using an infinite sequence to avoid having a hard limit on the available namespace prefixes.
+const prefixes_list = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
 options: Options,
 
 state: State,
 indent_level: u32,
 
 sink: Sink,
+
+aa: *std.heap.ArenaAllocator,
+a: std.mem.Allocator,
+
+// Namespaces. See https://www.w3.org/TR/xml-names/
+// elementStartNs and elementEndNs can be used to add namespaced elements to XML documents.
+// The Writer will automatically handle prefixes.
+
+// The Writer needs to retain some state for the namespaces in scope.
+// We'll use a stack as is natural fit for a recursive data structure like XML
+// Stack entry contains a list of tuples containing the currently-in-scope namespace/prefix mappings.
+namespaceStack: std.ArrayListUnmanaged(std.ArrayListUnmanaged(NsStateEntry)),
+// index into prefixes_list for namespace prefixes we've assigned
+usedPfix: usize,
+
+const NsStateEntry = struct {
+    prefix: []const u8,
+    namespace: []const u8,
+};
 
 const Writer = @This();
 
@@ -33,15 +56,25 @@ const State = enum {
     end,
 };
 
-pub fn init(sink: Sink, options: Options) Writer {
-    return .{
-        .options = options,
+pub fn init(a: std.mem.Allocator, sink: Sink, options: Options) !Writer {
+    var res: Writer = undefined;
+    // Arena allocator saves worrying too much about cleanup of complex data structure.
+    res.aa = try a.create(std.heap.ArenaAllocator);
+    res.aa.* = std.heap.ArenaAllocator.init(a);
+    res.a = res.aa.allocator();
+    res.options = options;
+    res.state = .start;
+    res.indent_level = 0;
+    res.sink = sink;
+    res.namespaceStack = .{};
+    res.usedPfix = 0;
+    return res;
+}
 
-        .state = .start,
-        .indent_level = 0,
-
-        .sink = sink,
-    };
+pub fn deinit(self: *Writer) void {
+    const allocator = self.aa.child_allocator;
+    self.aa.deinit();
+    allocator.destroy(self.aa);
 }
 
 pub const WriteError = error{};
@@ -73,6 +106,16 @@ pub fn xmlDeclaration(writer: *Writer, encoding: ?[]const u8, standalone: ?bool)
 }
 
 pub fn elementStart(writer: *Writer, name: []const u8) anyerror!void {
+    return elementStartNs(writer, name, null, .{});
+}
+
+pub const ElementStartNsOpts = struct {
+    defaultNs: ?[]const u8 = null,
+    prefixedNs: ?[]const []const u8 = null,
+};
+
+// 'opts' allows an element to introduce new default or prefixed namespaces
+pub fn elementStartNs(writer: *Writer, name: []const u8, namespace: ?[]const u8, opts: ElementStartNsOpts) anyerror!void {
     switch (writer.state) {
         .start, .after_bom, .after_xml_declaration, .text => {},
         .element_start => {
@@ -84,13 +127,71 @@ pub fn elementStart(writer: *Writer, name: []const u8) anyerror!void {
         },
         .end => unreachable,
     }
+
+    var attributesToAdd: std.ArrayListUnmanaged([2][]const u8) = .{};
+    var newState: std.ArrayListUnmanaged(NsStateEntry) = .{};
+    if (writer.namespaceStack.getLastOrNull()) |stackTop| {
+        newState = try stackTop.clone(writer.a); // everything from parent element remains in scope by default
+    }
+    if (opts.defaultNs) |newDefaultNs| {
+        for (newState.items, 0..) |*entry, i| {
+            if (entry.prefix.len == 0) {
+                _ = newState.swapRemove(i);
+                break;
+            }
+        }
+        try newState.append(writer.a, .{ .namespace = newDefaultNs, .prefix = "" });
+        try attributesToAdd.append(writer.a, [_][]const u8{ "xmlns", newDefaultNs });
+    }
+    if (opts.prefixedNs) |prefixedNses| {
+        lpns: for (prefixedNses) |pfns| {
+            for (newState.items) |entry| {
+                if (std.mem.eql(u8, entry.namespace, pfns)) {
+                    continue :lpns; // Skip it, it's already in our state
+                }
+            }
+            const prefix = prefixes_list[writer.usedPfix .. writer.usedPfix + 1];
+            writer.usedPfix += 1;
+            try newState.append(writer.a, .{ .namespace = pfns, .prefix = prefix });
+            const key = try std.fmt.allocPrint(writer.a, "xmlns:{s}", .{prefix});
+            try attributesToAdd.append(writer.a, [_][]const u8{ key, pfns });
+        }
+    }
+    try writer.namespaceStack.append(writer.a, newState);
+
     try writer.raw("<");
+    try writer.writeNs(namespace);
     try writer.raw(name);
+
     writer.state = .element_start;
     writer.indent_level += 1;
+
+    for (attributesToAdd.items) |attr| {
+        try writer.doAddAttribute(attr[0], attr[1]);
+    }
+}
+
+fn writeNs(writer: *Writer, namespace: ?[]const u8) anyerror!void {
+    if (namespace) |ns| {
+        const nsState = writer.namespaceStack.getLast();
+        for (nsState.items) |nsEntry| {
+            if (std.mem.eql(u8, nsEntry.namespace, ns)) {
+                if (nsEntry.prefix.len > 0) {
+                    try writer.raw(nsEntry.prefix);
+                    try writer.raw(":");
+                }
+                return;
+            }
+        } else {
+            return error.InvalidNamespace;
+        }
+    }
 }
 
 pub fn elementEnd(writer: *Writer, name: []const u8) anyerror!void {
+    return elementEndNs(writer, name, null);
+}
+pub fn elementEndNs(writer: *Writer, name: []const u8, namespace: ?[]const u8) anyerror!void {
     writer.indent_level -= 1;
     switch (writer.state) {
         .text => {},
@@ -103,9 +204,12 @@ pub fn elementEnd(writer: *Writer, name: []const u8) anyerror!void {
         },
         .start, .after_bom, .after_xml_declaration, .end => unreachable,
     }
+
     try writer.raw("</");
+    try writer.writeNs(namespace);
     try writer.raw(name);
     try writer.raw(">");
+    _ = writer.namespaceStack.pop();
     writer.state = if (writer.indent_level > 0) .after_structure_end else .end;
 }
 
@@ -117,6 +221,14 @@ pub fn elementEndEmpty(writer: *Writer) anyerror!void {
 }
 
 pub fn attribute(writer: *Writer, name: []const u8, value: []const u8) anyerror!void {
+    if (std.mem.eql(u8, name, "xmlns") or std.mem.startsWith(u8, name, "xmlns:")) {
+        // Use elementStartNs instead.
+        return error.AttributeError;
+    }
+    return doAddAttribute(writer, name, value);
+}
+
+fn doAddAttribute(writer: *Writer, name: []const u8, value: []const u8) anyerror!void {
     assert(writer.state == .element_start);
     try writer.raw(" ");
     try writer.raw(name);
@@ -216,14 +328,16 @@ test {
 }
 const T = struct {
     const Testbed = struct {
-        buf: std.ArrayList(u8),
+        a: std.mem.Allocator,
+        buf: std.ArrayListUnmanaged(u8),
         fn init(a: std.mem.Allocator) Testbed {
             return .{
-                .buf = std.ArrayList(u8).init(a),
+                .a = a,
+                .buf = .{},
             };
         }
-        fn writer(self: *Testbed, indent: []const u8) Writer {
-            return Writer.init(.{
+        fn writer(self: *Testbed, indent: []const u8) !Writer {
+            return Writer.init(self.a, .{
                 .context = self,
                 .writeFn = write,
             }, .{ .indent = indent });
@@ -231,19 +345,20 @@ const T = struct {
         fn write(context: *const anyopaque, data: []const u8) anyerror!void {
             // TODO not sure why context is const.
             var self: *Testbed = @constCast(@alignCast(@ptrCast(context)));
-            try self.buf.appendSlice(data);
+            try self.buf.appendSlice(self.a, data);
         }
         fn output(self: *Testbed) []const u8 {
             return self.buf.items;
         }
         fn deinit(self: *Testbed) void {
-            self.buf.deinit();
+            self.buf.deinit(self.a);
         }
     };
     test "embed" {
         var tb = Testbed.init(std.testing.allocator);
         defer tb.deinit();
-        var wtr = tb.writer("  ");
+        var wtr = try tb.writer("  ");
+        defer wtr.deinit();
         try wtr.xmlDeclaration("UTF-8", null);
         try wtr.elementStart("foo");
         try wtr.embed("<bar>Baz!</bar>");
@@ -251,6 +366,60 @@ const T = struct {
         try std.testing.expectEqualStrings(
             \\<?xml version="1.0" encoding="UTF-8"?>
             \\<foo><bar>Baz!</bar></foo>
+        , tb.output());
+    }
+
+    test "namespace" {
+        var tb = Testbed.init(std.testing.allocator);
+        defer tb.deinit();
+        var wtr = try tb.writer("  ");
+        defer wtr.deinit();
+        try wtr.elementStartNs("foo", "foospace", .{
+            .defaultNs = "barspace",
+            .prefixedNs = &.{ "foospace", "bazspace" },
+        });
+        // nested element changes the default namespace and repeats an existing prefixed namespace
+        try wtr.elementStartNs("zap", "zapspace", .{
+            .defaultNs = "zapspace",
+            .prefixedNs = &.{ "bazspace", "zingspace" },
+        });
+        // sub-element inherits the new default
+        try wtr.elementStartNs("zip", "zapspace", .{});
+        try wtr.elementEndNs("zip", "zapspace");
+        // sub-element can still access prefixes from outer scope
+        try wtr.elementStartNs("fooooo", "foospace", .{});
+        try wtr.elementEndNs("fooooo", "foospace");
+        try wtr.elementEndNs("zap", "zapspace");
+        // element in the default namespace; should have no prefix
+        try wtr.elementStartNs("bar", "barspace", .{});
+        try wtr.elementEndNs("bar", "barspace");
+        // element in a prefixed namespace
+        try wtr.elementStartNs("baz", "bazspace", .{});
+        // nested element in default namespace
+        try wtr.elementStartNs("fee", "barspace", .{});
+        try wtr.elementEndNs("fee", "barspace");
+        // nested element introduces another namespace
+        try wtr.elementStartNs("fie", "fiespace", .{ .prefixedNs = &.{"fiespace"} });
+        try wtr.elementEndNs("fie", "fiespace");
+        try wtr.elementEndNs("baz", "bazspace");
+        try wtr.elementEndNs("foo", "foospace");
+        try std.testing.expectEqualStrings(
+            \\<a:foo xmlns="barspace" xmlns:a="foospace" xmlns:b="bazspace">
+            \\  <zap xmlns="zapspace" xmlns:c="zingspace">
+            \\    <zip>
+            \\    </zip>
+            \\    <a:fooooo>
+            \\    </a:fooooo>
+            \\  </zap>
+            \\  <bar>
+            \\  </bar>
+            \\  <b:baz>
+            \\    <fee>
+            \\    </fee>
+            \\    <d:fie xmlns:d="fiespace">
+            \\    </d:fie>
+            \\  </b:baz>
+            \\</a:foo>
         , tb.output());
     }
 };
